@@ -11,7 +11,10 @@ import (
 )
 
 const COLOR_FORMAT string = "\033[3%dm%s\033[0m"
-const NUM_COLORS int = 6
+const NUM_COLORS = 6
+
+var messageBuffer = make(chan message)
+var processWait sync.WaitGroup
 
 type message struct {
 	content string
@@ -22,67 +25,62 @@ func (output message) String() string {
 	return fmt.Sprintf(COLOR_FORMAT, (output.sender%NUM_COLORS)+1, output.content)
 }
 
-var messageBuffer = make(chan message)
-var exitCount int = 0
-var numProcs int
-var exitLock sync.Mutex
-
-func readPipe(pipe io.ReadCloser, commandBuffer chan string, wait *sync.WaitGroup) {
+func readPipe(pipe io.ReadCloser, mergedOutput chan string, wait *sync.WaitGroup) {
+	defer wait.Done()
 	output := bufio.NewScanner(pipe)
 	for output.Scan() {
-		commandBuffer <- output.Text()
+		mergedOutput <- output.Text()
 	}
-	wait.Done()
 }
 
-// Sends both stdout and stderror of command to commandBuffer
-func bufferOutput(command *exec.Cmd, commandBuffer chan string, start chan bool) {
-	stdoutPipe, err := command.StdoutPipe()
+// Sends both stdout and stderror of command to mergedOutput
+func mergeOutErr(command *exec.Cmd, mergedOutput chan string) {
+	stdout, err := command.StdoutPipe()
 	if err != nil {
-		panic("Could not connect to stdout of process " + command.Path)
+		panic(fmt.Sprintf("Could not connect to stdout of process '%s'. Error: %s", command.Path, err))
 	}
-	stderrorPipe, err := command.StderrPipe()
+	stderror, err := command.StderrPipe()
 	if err != nil {
-		panic("Could not connect to stderror of process " + command.Path)
+		panic(fmt.Sprintf("Could not connect to stderr of process '%s'. Error: %s", command.Path, err))
 	}
-	start <- true
+	if err := command.Start(); err != nil {
+		panic(fmt.Sprintf("Could not start process '%s'. Error: %s", command.Path, err))
+	} else {
+		mergedOutput <- fmt.Sprintf("Started '%s' (%d)", command.Path, command.Process.Pid)
+	}
 	var both sync.WaitGroup
 	both.Add(2)
-	go readPipe(stdoutPipe, commandBuffer, &both)
-	go readPipe(stderrorPipe, commandBuffer, &both)
+	go readPipe(stdout, mergedOutput, &both)
+	go readPipe(stderror, mergedOutput, &both)
 	both.Wait()
-	close(commandBuffer)
+	close(mergedOutput)
 }
 
 func listenTo(command *exec.Cmd, id int) {
-	commandBuffer := make(chan string)
-	start := make(chan bool)
-	go bufferOutput(command, commandBuffer, start)
-	<-start
-	if err := command.Start(); err != nil {
-		panic(fmt.Sprintf("Could not start process '%s'. Error: %s", command.Path, err))
+	defer processWait.Done()
+	mergedOutput := make(chan string)
+	go mergeOutErr(command, mergedOutput)
+	for line := range mergedOutput {
+		messageBuffer <- message{line, id}
 	}
-	for output := range commandBuffer {
-		messageBuffer <- message{output, id}
+	if err := command.Wait(); err != nil {
+		messageBuffer <- message{fmt.Sprintf("Process '%s' (%d) exited with %s", command.Path, command.Process.Pid, err), id}
 	}
-	//command.Wait()
-	exitLock.Lock()
-	exitCount++
-	if exitCount == numProcs {
-		close(messageBuffer)
-	}
-	exitLock.Unlock()
 }
 
 func main() {
-	numProcs = len(os.Args) - 1
-	if numProcs < 2 {
+	if len(os.Args) < 3 {
 		panic("Must supply at least two processes to run")
 	}
+	processWait.Add(len(os.Args) - 1)
 	for i, cmd := range os.Args[1:] {
 		fields := strings.Fields(cmd)
 		go listenTo(exec.Command(fields[0], fields[1:]...), i)
 	}
+	go (func() {
+		processWait.Wait()
+		close(messageBuffer)
+	})()
 	for output := range messageBuffer {
 		fmt.Println(output)
 	}
