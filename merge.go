@@ -20,19 +20,20 @@ var messageBuffer = make(chan message)
 var processWait sync.WaitGroup
 
 type message struct {
-	content string
-	sender  int
+	content     string
+	sender      int
+	destination *os.File
 }
 
 func (output message) String() string {
 	return fmt.Sprintf(COLOR_FORMAT, (output.sender%NUM_COLORS)+1, output.content)
 }
 
-func readPipe(pipe io.ReadCloser, mergedOutput chan string, wait *sync.WaitGroup) {
+func readPipe(pipe io.ReadCloser, destination *os.File, id int, mergedOutput chan message, wait *sync.WaitGroup) {
 	defer wait.Done()
 	output := bufio.NewScanner(pipe)
 	for output.Scan() {
-		mergedOutput <- TRIM_COLORS_PATTERN.ReplaceAllString(output.Text(), "")
+		mergedOutput <- message{TRIM_COLORS_PATTERN.ReplaceAllString(output.Text(), ""), id, destination}
 	}
 }
 
@@ -45,7 +46,7 @@ func identifier(command *exec.Cmd) string {
 }
 
 // Sends both stdout and stderror of command to mergedOutput
-func mergeOutErr(command *exec.Cmd, mergedOutput chan string) {
+func mergeOutErr(command *exec.Cmd, id int, mergedOutput chan message) {
 	stdout, err := command.StdoutPipe()
 	if err != nil {
 		fatal(fmt.Sprintf("Could not connect to stdout of process '%s'. Details: %s", identifier(command), err))
@@ -57,31 +58,31 @@ func mergeOutErr(command *exec.Cmd, mergedOutput chan string) {
 	if err := command.Start(); err != nil {
 		fatal(fmt.Sprintf("Could not start process '%s'. Details: %s", identifier(command), err))
 	} else {
-		mergedOutput <- fmt.Sprintf("Started '%s' (%d)", identifier(command), command.Process.Pid)
+		mergedOutput <- message{fmt.Sprintf("Started '%s' (%d)", identifier(command), command.Process.Pid), id, os.Stdout}
 	}
 	var both sync.WaitGroup
 	both.Add(2)
-	go readPipe(stdout, mergedOutput, &both)
-	go readPipe(stderror, mergedOutput, &both)
+	go readPipe(stdout, os.Stdout, id, mergedOutput, &both)
+	go readPipe(stderror, os.Stderr, id, mergedOutput, &both)
 	both.Wait()
 	close(mergedOutput)
 }
 
 func listenTo(command *exec.Cmd, id int) {
 	defer processWait.Done()
-	mergedOutput := make(chan string)
-	go mergeOutErr(command, mergedOutput)
-	for line := range mergedOutput {
-		messageBuffer <- message{line, id}
+	mergedOutput := make(chan message)
+	go mergeOutErr(command, id, mergedOutput)
+	for message := range mergedOutput {
+		messageBuffer <- message
 	}
 	if err, ok := (command.Wait()).(*exec.ExitError); err != nil {
 		if ok {
-			messageBuffer <- message{fmt.Sprintf("Process '%s' (%d) exited with status %d", identifier(command), command.Process.Pid, err.ExitCode()), id}
+			messageBuffer <- message{fmt.Sprintf("Process '%s' (%d) exited with status %d", identifier(command), command.Process.Pid, err.ExitCode()), id, os.Stdout}
 		} else {
-			messageBuffer <- message{fmt.Sprintf("Process '%s' (%d) exited abnormally. Details: %s", identifier(command), command.Process.Pid, err), id}
+			messageBuffer <- message{fmt.Sprintf("Process '%s' (%d) exited abnormally. Details: %s", identifier(command), command.Process.Pid, err), id, os.Stdout}
 		}
 	} else {
-		messageBuffer <- message{fmt.Sprintf("Process '%s' (%d) exited successfully", identifier(command), command.Process.Pid), id}
+		messageBuffer <- message{fmt.Sprintf("Process '%s' (%d) exited successfully", identifier(command), command.Process.Pid), id, os.Stdout}
 	}
 }
 
@@ -105,6 +106,6 @@ func main() {
 		close(messageBuffer)
 	})()
 	for output := range messageBuffer {
-		fmt.Println(output)
+		fmt.Fprintln(output.destination, output)
 	}
 }
