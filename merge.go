@@ -26,7 +26,21 @@ type message struct {
 }
 
 func (output message) String() string {
-	return fmt.Sprintf(COLOR_FORMAT, (output.sender%NUM_COLORS)+1, output.content)
+	if isTerminal(output.destination) {
+		return fmt.Sprintf(COLOR_FORMAT, (output.sender%NUM_COLORS)+1, output.content)
+	}
+	return output.content
+}
+
+var isTerminalCache = make(map[*os.File]bool) // Avoid making a Stat syscall for every message
+
+func isTerminal(file *os.File) bool {
+	if fileIsTerminal, ok := isTerminalCache[file]; ok {
+		return fileIsTerminal
+	}
+	info, err := file.Stat()
+	isTerminalCache[file] = (err == nil) && (info.Mode()&os.ModeCharDevice != 0)
+	return isTerminalCache[file]
 }
 
 func readPipe(pipe io.ReadCloser, destination *os.File, id int, mergedOutput chan message, wait *sync.WaitGroup) {
