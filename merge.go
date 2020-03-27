@@ -14,11 +14,6 @@ import (
 const COLOR_FORMAT string = "\033[3%dm%s\033[0m"
 const NUM_COLORS = 6
 
-var TRIM_COLORS_PATTERN *regexp.Regexp
-
-var messageBuffer = make(chan message)
-var processWait sync.WaitGroup
-
 type message struct {
 	content     string
 	sender      int
@@ -42,6 +37,8 @@ func isTerminal(file *os.File) bool {
 	isTerminalCache[file] = (err == nil) && (info.Mode()&os.ModeCharDevice != 0)
 	return isTerminalCache[file]
 }
+
+var TRIM_COLORS_PATTERN *regexp.Regexp = regexp.MustCompile("\033\\[[^m]*m")
 
 func readPipe(pipe io.ReadCloser, destination *os.File, id int, mergedOutput chan message, wait *sync.WaitGroup) {
 	defer wait.Done()
@@ -82,7 +79,7 @@ func mergeOutErr(command *exec.Cmd, id int, mergedOutput chan message) {
 	close(mergedOutput)
 }
 
-func listenTo(command *exec.Cmd, id int) {
+func listenTo(command *exec.Cmd, id int, messageBuffer chan message, processWait *sync.WaitGroup) {
 	defer processWait.Done()
 	mergedOutput := make(chan message)
 	go mergeOutErr(command, id, mergedOutput)
@@ -109,11 +106,12 @@ func main() {
 	if len(os.Args) < 3 {
 		fatal("Must supply at least two processes to run")
 	}
-	TRIM_COLORS_PATTERN = regexp.MustCompile("\033\\[[^m]*m")
+	var processWait sync.WaitGroup
 	processWait.Add(len(os.Args) - 1)
+	messageBuffer := make(chan message)
 	for i, cmd := range os.Args[1:] {
 		fields := strings.Fields(cmd)
-		go listenTo(exec.Command(fields[0], fields[1:]...), i)
+		go listenTo(exec.Command(fields[0], fields[1:]...), i, messageBuffer, &processWait)
 	}
 	go (func() {
 		processWait.Wait()
